@@ -1,0 +1,56 @@
+# M1 最小部署栈：PostgreSQL 15 + 后端
+# 用法：
+#   1. mvn -B clean package -DskipTests   （生成 target/auto-deploy-server-0.1.0-SNAPSHOT.jar）
+#   2. docker compose up -d               （PG 自动初始化，后端等 PG 健康后启动）
+#   3. 浏览器访问 http://localhost:8080  （后端暂不托管前端；开发用 web/ 下 Vite dev server 代理）
+# 说明：前端生产构建产物 web/dist 由 Nginx 同源反代 /api（M1 不内置，避免额外镜像维护）
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: autodeploy-db
+    environment:
+      POSTGRES_DB: autodeploy
+      POSTGRES_USER: deploy
+      POSTGRES_PASSWORD: deploy123
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U deploy -d autodeploy"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  backend:
+    image: eclipse-temurin:17-jre
+    container_name: autodeploy-backend
+    working_dir: /app
+    # 直接把构建产物 jar 挂进容器，避免额外 Dockerfile
+    volumes:
+      - ./target/auto-deploy-server-0.1.0-SNAPSHOT.jar:/app/app.jar:ro
+      - deploy-data:/app/data
+    command: ["java", "-jar", "/app/app.jar"]
+    environment:
+      # 固定 UTC：DB 统一存 UTC 时间戳（与 JacksonTimeConfig 的 Z 序列化对齐），
+      # 前端按浏览器本地时区渲染，避免慢 8 小时
+      TZ: UTC
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_NAME: autodeploy
+      DB_USER: deploy
+      DB_PASSWORD: deploy123
+      DEPLOY_DATA_DIR: /app/data
+      # 容器内运行必须用强密钥（默认 enforce-strong=true 会拒绝占位值）
+      DEPLOY_JWT_SECRET: "change-me-in-real-deployment-please-64bytes!!!"
+      CREDENTIAL_KEK: "change-me-32-byte-kek-for-ssh-creds!!"
+      DEPLOY_SEED_PASSWORD: admin123
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  deploy-data:

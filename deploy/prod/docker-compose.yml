@@ -1,0 +1,69 @@
+# 正式环境部署栈：PostgreSQL 15 + 后端 + Nginx（托管前端构建产物并同源反代 /api）
+# 部署方式（在目标机 /opt/autodeploy 目录）：
+#   1. 复制 .env.example 为 .env 并填入强密钥（.env 已被 gitignore，禁止提交）
+#   2. docker compose up -d（compose 自动加载同目录 .env）
+# 端口：8081（Nginx 前端 + /api 反代；80 已被 ai-api-manager-frontend 占用）
+# 说明：
+#   - 前端为 web/dist 构建产物（vite build），由 Nginx 静态托管
+#   - 后端 jar 挂载自 ./auto-deploy-server.jar（部署脚本由 target 复制而来）
+#   - JWT / KEK 为生产强密钥，更换 JWT secret 会使已登录 token 失效，
+#     更换 KEK 会导致已加密的凭据/模型 key 无法解密
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: autodeploy-db
+    environment:
+      TZ: Asia/Shanghai
+      POSTGRES_DB: autodeploy
+      POSTGRES_USER: deploy
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?请在 .env 中配置 DB_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U deploy -d autodeploy"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  backend:
+    image: eclipse-temurin:17-jre
+    container_name: autodeploy-backend
+    working_dir: /app
+    volumes:
+      - ./auto-deploy-server.jar:/app/app.jar:ro
+      - deploy-data:/app/data
+    command: ["java", "-jar", "/app/app.jar"]
+    environment:
+      # 固定北京时间：DB 统一存北京时间戳（timestamp without time zone，
+      # 与 JacksonTimeConfig 无时区 ISO 序列化对齐），前端直接按本地时区渲染
+      TZ: Asia/Shanghai
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_NAME: autodeploy
+      DB_USER: deploy
+      DB_PASSWORD: ${DB_PASSWORD:?请在 .env 中配置 DB_PASSWORD}
+      DEPLOY_DATA_DIR: /app/data
+      # 强密钥必须来自 .env（生产环境强制校验，缺省占位值会导致启动 fail-fast）
+      DEPLOY_JWT_SECRET: ${DEPLOY_JWT_SECRET:?请在 .env 中配置 DEPLOY_JWT_SECRET}
+      CREDENTIAL_KEK: ${CREDENTIAL_KEK:?请在 .env 中配置 CREDENTIAL_KEK}
+      DEPLOY_SEED_PASSWORD: ${DEPLOY_SEED_PASSWORD:?请在 .env 中配置 DEPLOY_SEED_PASSWORD}
+    depends_on:
+      db:
+        condition: service_healthy
+
+  web:
+    image: nginx:1.27-alpine
+    container_name: autodeploy-web
+    environment:
+      TZ: Asia/Shanghai
+    volumes:
+      - ./web-dist:/usr/share/nginx/html:ro
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "8081:80"
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:
+  deploy-data:

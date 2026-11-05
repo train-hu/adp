@@ -1,0 +1,8 @@
+target/
+data/
+.idea/
+*.iml
+.vscode/
+node_modules/
+web/dist/
+.env

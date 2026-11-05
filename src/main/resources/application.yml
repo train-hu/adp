@@ -1,0 +1,71 @@
+spring:
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:autodeploy}
+    username: ${DB_USER:deploy}
+    password: ${DB_PASSWORD:deploy123}
+  servlet:
+    multipart:
+      # 部署包上传大小上限：单文件 2GB（与 deploy.max-upload-size 对齐，业务层再做一次校验）
+      max-file-size: 2GB
+      max-request-size: 2200MB
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+deploy:
+  data-dir: ${DEPLOY_DATA_DIR:data}
+  # 部署包上传大小上限（字节），默认 2GB；业务层（ProjectService）据此拒绝超大文件
+  max-upload-size: ${DEPLOY_MAX_UPLOAD_SIZE:2147483648}
+  credential-kek: ${CREDENTIAL_KEK:dev-only-32-byte-kek-please-change!}
+  seed-password: ${DEPLOY_SEED_PASSWORD:admin123}
+  # JWT 签名密钥（HMAC-SHA256）。默认值为 32 字节公开占位，生产环境必须通过
+  # DEPLOY_JWT_SECRET 环境变量覆盖为强密钥（>32 字节、非占位值），否则 token 可被伪造。
+  jwt-secret: ${DEPLOY_JWT_SECRET:auto-deploy-dev-jwt-secret-key!!}
+  # 强密钥校验开关（默认 true）：开启时若 jwt-secret 为空 / <32 字节 / 等于公开占位值，
+  # 应用启动即 fail-fast 拒绝初始化。生产必须保持 true 并配置强 secret；
+  # 仅本地开发可用 DEPLOY_JWT_SECRET_ENFORCE_STRONG=false 关闭。
+  jwt-secret-enforce-strong: ${DEPLOY_JWT_SECRET_ENFORCE_STRONG:true}
+  # JWT 过期时间（小时），默认 24h。
+  jwt-expire-hours: ${DEPLOY_JWT_EXPIRE_HOURS:24}
+  # 登录防爆破（LoginRateLimiter）：同一 (IP, 用户名) 连续失败 max-failures 次后
+  # 锁定 lock-duration（锁定期内直接 403，不再校验凭证）。
+  login:
+    max-failures: ${DEPLOY_LOGIN_MAX_FAILURES:5}
+    lock-duration: ${DEPLOY_LOGIN_LOCK_DURATION:15m}
+    clean-delay-ms: ${DEPLOY_LOGIN_CLEAN_DELAY_MS:600000}
+  # 部署执行线程池（DeployAsyncConfig → deployRunnerExecutor）
+  runner:
+    core-pool-size: 2
+    max-pool-size: 4
+    queue-capacity: 20
+    # 启动恢复（DeploymentRecoveryRunner）：PENDING 超过该分钟数未开始视为僵尸任务
+    recovery-pending-timeout-minutes: 10
+  # 健康检查（VerifyStepExecutor）：失败重试次数与间隔
+  verify:
+    attempts: 10
+    interval-ms: 3000
+  # 定时清理任务（MaintenanceTasks）：过期分片上传会话清理 + 数据保留清理
+  cleanup:
+    upload-scan-delay-ms: ${DEPLOY_CLEANUP_UPLOAD_SCAN_DELAY_MS:3600000}
+    upload-expire-hours: ${DEPLOY_CLEANUP_UPLOAD_EXPIRE_HOURS:24}
+    retention-cron: ${DEPLOY_CLEANUP_RETENTION_CRON:0 30 3 * * *}
+    audit-retention-days: ${DEPLOY_CLEANUP_AUDIT_RETENTION_DAYS:365}
+    notification-retention-days: ${DEPLOY_CLEANUP_NOTIFICATION_RETENTION_DAYS:30}
+    deployment-retention-days: ${DEPLOY_CLEANUP_DEPLOYMENT_RETENTION_DAYS:365}
+  # SSH 连接池（MinaSshExecutor）：连接按 server 维度缓存复用；
+  # 空闲超过 connection-idle-timeout-minutes 的连接由定时任务回收（每 idle-clean-delay-ms 扫描一次）
+  ssh:
+    connection-idle-timeout-minutes: ${DEPLOY_SSH_CONNECTION_IDLE_TIMEOUT_MINUTES:30}
+    idle-clean-delay-ms: ${DEPLOY_SSH_IDLE_CLEAN_DELAY_MS:300000}
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      show-details: never
+  metrics:
+    tags:
+      # 所有指标统一带应用名 tag，便于多环境/多实例聚合区分
+      application: auto-deploy
