@@ -47,6 +47,18 @@ public class DockerStartExecutor {
      */
     private static final Pattern COMPOSE_PORT_LINE = Pattern.compile(
             "(?m)^([ \\t]*-[ \\t]*)(\\\")?(\\d+):(\\d+)(\\\"?[ \\t]*(?:#.*)?)$");
+    /** compose build 段标识（行首缩进后 {@code build:}），用于判断 compose 是否含本地构建。 */
+    static final Pattern COMPOSE_BUILD_LINE = Pattern.compile(
+            "(?m)^[ \\t]+build:[ \\t]*(?:#.*)?$");
+    /**
+     * build 段 context 键：{@code context: .} / {@code context: "./x"}（带引号可选）。
+     * 分组：1=行首至冒号后空格 2=context 值（含引号）。
+     */
+    static final Pattern COMPOSE_BUILD_CONTEXT_LINE = Pattern.compile(
+            "(?m)^([ \\t]+context:[ \\t]*)([^\n#]+)");
+    /** build 段 dockerfile 键：{@code dockerfile: Dockerfile}（带引号可选）。分组同 context。 */
+    static final Pattern COMPOSE_DOCKERFILE_LINE = Pattern.compile(
+            "(?m)^([ \\t]+dockerfile:[ \\t]*)([^\n#]+)");
 
     private static final Logger log = LoggerFactory.getLogger(DockerStartExecutor.class);
 
@@ -141,7 +153,10 @@ public class DockerStartExecutor {
         //    两者较小值，保证被回写的目标端口也纳入占用探测；compose 无 ports 段时回落到 port。
         //    anchor 被占用则重写 compose 中 host 侧等于 anchor 的映射为空闲端口，
         //    保证 up -d 不会因宿主机端口冲突失败、健康检查端口与实际一致。
-        String effectiveCompose = composeContent;
+        //    写盘前先做 build context 规范化：上传 compose 若以 workdir 根为构建上下文
+        //    （context: .）而源码实际在 extract/ 下（Dockerfile 不在根），构建必然失败
+        //    （buildkit 按 0 字节读缺失的 Dockerfile）；此时把 context 改指 ./extract。
+        String effectiveCompose = normalizeBuildContext(workdir, composeContent, serverId);
         Integer resolvedPort = port;
         if (port != null) {
             Set<Integer> busy = probeBusyPorts(serverId);
@@ -200,6 +215,129 @@ public class DockerStartExecutor {
         detail.put("dockerfileWritten", dockerfileWritten);
         detail.put("resolvedPort", resolvedPort);
         return detail;
+    }
+
+    /**
+     * 规范化 compose 的 build context（写盘前调用）。
+     *
+     * <p>平台布局：上传包解压到 {@code {workdir}/extract/}，compose 写到 {@code {workdir}/docker-compose.yml}，
+     * 平台托管的 Dockerfile（若有）写到 {@code {workdir}/extract/Dockerfile}。
+     * 用户自带的 compose 若声明 {@code build.context: .}（workdir 根）而根目录并无 Dockerfile
+     * （源码都在 extract/），构建时 buildkit 读不到 Dockerfile 必然失败（按 0 字节传输报
+     * "transferring dockerfile: 2B"）。
+     *
+     * <p>规则：build 段存在、context 为根（{@code .}/{@code ./}/{@code .\/}）、根目录无 Dockerfile
+     * 且 extract/ 存在时，把 context 改写为 {@code ./extract}；若同时声明 {@code dockerfile: <相对路径>}
+     * （非绝对、非 extract 前缀），同步加 {@code extract/} 前缀，保持"上下文根 + 相对路径"语义不变。
+     * 其余情况（context 已是 ./extract、根目录本就有 Dockerfile、无 build 段、context 为其他相对路径）
+     * 一律原样返回——不猜测、不破坏用户显式配置。
+     *
+     * @param workdir    部署工作目录（绝对路径）
+     * @param compose    原始 compose 内容
+     * @param serverId   目标服务器（用于探测根目录 / extract 是否存在）
+     * @return 规范化后的 compose（未触发改写时与原串相同）
+     */
+    String normalizeBuildContext(String workdir, String compose, long serverId) {
+        if (compose == null || compose.isBlank()) {
+            return compose;
+        }
+        if (!hasBuildSection(compose)) {
+            return compose;
+        }
+        String context = extractBuildContext(compose);
+        if (context == null || !isRootContext(context)) {
+            return compose;
+        }
+        // 根目录已有 Dockerfile：用户 compose 与平台布局一致，无需改写
+        if (pathExists(serverId, workdir + "/Dockerfile")) {
+            return compose;
+        }
+        if (!pathExists(serverId, workdir + "/extract")) {
+            // extract 不存在（异常状态）：保持原样让 up -d 自身报错，交由上层失败流程
+            return compose;
+        }
+        String rewritten = rewriteBuildContext(compose, "./extract");
+        if (rewritten != null) {
+            log.info("normalized compose build context from root to ./extract (workdir={})", workdir);
+        }
+        return rewritten != null ? rewritten : compose;
+    }
+
+    /** compose 是否含至少一个 build 段（粗判：行首缩进后的 {@code build:}）。 */
+    static boolean hasBuildSection(String compose) {
+        return COMPOSE_BUILD_LINE.matcher(compose).find();
+    }
+
+    /**
+     * 提取首个 build 段的 context 值（{@code context: .} → {@code .}）。无 build.context 时返回 null。
+     * 兼容 {@code context: .} / {@code context: "./"} / 带引号形式。
+     */
+    static String extractBuildContext(String compose) {
+        Matcher m = COMPOSE_BUILD_CONTEXT_LINE.matcher(compose);
+        if (!m.find()) {
+            return null;
+        }
+        String v = m.group(2).trim();
+        // 去掉成对的引号
+        if (v.length() >= 2 && ((v.startsWith("\"") && v.endsWith("\""))
+                || (v.startsWith("'") && v.endsWith("'")))) {
+            v = v.substring(1, v.length() - 1);
+        }
+        return v.isEmpty() ? null : v;
+    }
+
+    /** context 是否指 build 上下文根（{@code .}/{@code ./}，带引号已在提取时去掉）。 */
+    static boolean isRootContext(String context) {
+        return ".".equals(context) || "./".equals(context);
+    }
+
+    /**
+     * 把首个 build 段的 {@code context:} 值改写为 {@code newContext}，并对同段 {@code dockerfile:}
+     * 的相对路径加 {@code extract/} 前缀（若尚未有）。找不到可改写的 context 行时返回 null。
+     */
+    static String rewriteBuildContext(String compose, String newContext) {
+        Matcher m = COMPOSE_BUILD_CONTEXT_LINE.matcher(compose);
+        if (!m.find()) {
+            return null;
+        }
+        // 先定位 dockerfile 键（原始串上的位置），再改 context；replaceFirst 顺序保证前缀不互相污染
+        Matcher df = COMPOSE_DOCKERFILE_LINE.matcher(compose);
+        String dfPrefix = null;
+        if (df.find()) {
+            String v = df.group(2).trim();
+            String unquoted = v;
+            if (unquoted.length() >= 2 && ((unquoted.startsWith("\"") && unquoted.endsWith("\""))
+                    || (unquoted.startsWith("'") && unquoted.endsWith("'")))) {
+                unquoted = unquoted.substring(1, unquoted.length() - 1);
+            }
+            if (!unquoted.isEmpty() && !unquoted.startsWith("/")
+                    && !unquoted.equals("extract") && !unquoted.startsWith("extract/")) {
+                dfPrefix = df.group(1) + "extract/" + unquoted;
+            }
+        }
+        String replaced = compose.substring(0, m.start()) + m.group(1) + newContext
+                + compose.substring(m.end());
+        if (dfPrefix != null) {
+            // context 行在 dockerfile 行之前的常规布局下，行长度变化不影响按行改写
+            Matcher df2 = COMPOSE_DOCKERFILE_LINE.matcher(replaced);
+            if (df2.find()) {
+                replaced = replaced.substring(0, df2.start()) + dfPrefix + replaced.substring(df2.end());
+            }
+        }
+        return replaced;
+    }
+
+    /** 远端路径是否存在（SSH 测试，尽力而为：SSH 失败视为不存在）。 */
+    boolean pathExists(long serverId, String path) {
+        try {
+            CommandResult r = sshService.execute(serverId,
+                    "test -e " + ShellQuoter.quote(path) + " && echo EXISTS || echo MISSING", PROBE_TIMEOUT_MS);
+            return !r.getTimedOut() && r.getExitCode() == 0
+                    && r.getStdout() != null && r.getStdout().contains("EXISTS");
+        } catch (RuntimeException e) {
+            log.warn("probe path {} on server {} failed (ssh): {}", path, serverId, e.getMessage());
+            return false;
+        }
     }
 
     /**

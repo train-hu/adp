@@ -1076,6 +1076,88 @@ class StepExecutorsTest {
         assertThat(DockerStartExecutor.extractHostPort(null)).isNull();
     }
 
+    // ---------- build context 规范化（上传 compose context: . → ./extract） ----------
+
+    @Test
+    @DisplayName("normalizeBuildContext: context 为根且根无 Dockerfile、extract 存在 → 改写为 ./extract")
+    void normalizeBuildContext_rootToExtract() {
+        String compose = "services:\n  backend:\n    build:\n      context: .\n      dockerfile: Dockerfile.backend\n";
+        when(sshService.execute(eq(1L), anyString(), anyInt()))
+                .thenAnswer(inv -> {
+                    String cmd = inv.getArgument(1);
+                    if (cmd.contains("/opt/deploy/api-manager/29/Dockerfile")) {
+                        return CommandResult.ok("MISSING", 1); // 根目录无 Dockerfile
+                    }
+                    return CommandResult.ok("EXISTS", 0);      // extract 存在
+                });
+        DockerStartExecutor ex = new DockerStartExecutor(sshService);
+        String out = ex.normalizeBuildContext("/opt/deploy/api-manager/29", compose, 1L);
+        assertThat(out).contains("context: ./extract");
+        assertThat(out).contains("dockerfile: extract/Dockerfile.backend");
+    }
+
+    @Test
+    @DisplayName("normalizeBuildContext: 根目录已有 Dockerfile → 不改写")
+    void normalizeBuildContext_rootHasDockerfile_keeps() {
+        String compose = "services:\n  backend:\n    build:\n      context: .\n";
+        when(sshService.execute(eq(1L), anyString(), anyInt()))
+                .thenReturn(CommandResult.ok("EXISTS", 0)); // 根目录有 Dockerfile
+        DockerStartExecutor ex = new DockerStartExecutor(sshService);
+        assertThat(ex.normalizeBuildContext("/opt/x", compose, 1L)).isEqualTo(compose);
+    }
+
+    @Test
+    @DisplayName("normalizeBuildContext: context 已是 ./extract 或无 build 段 → 不改写")
+    void normalizeBuildContext_alreadyCorrect_orNoBuild_keeps() {
+        String already = "services:\n  web:\n    build:\n      context: ./extract\n";
+        String noBuild = "services:\n  web:\n    image: nginx\n";
+        DockerStartExecutor ex = new DockerStartExecutor(sshService);
+        // 无 SSH 探测也应原样返回（不触发改写路径）
+        assertThat(ex.normalizeBuildContext("/opt/x", already, 1L)).isEqualTo(already);
+        assertThat(ex.normalizeBuildContext("/opt/x", noBuild, 1L)).isEqualTo(noBuild);
+    }
+
+    @Test
+    @DisplayName("normalizeBuildContext: extract 不存在 → 原样（让 up -d 自行报错）")
+    void normalizeBuildContext_noExtract_keeps() {
+        String compose = "services:\n  web:\n    build:\n      context: .\n";
+        when(sshService.execute(eq(1L), anyString(), anyInt()))
+                .thenAnswer(inv -> {
+                    String cmd = inv.getArgument(1);
+                    if (cmd.contains("/opt/deploy/api-manager/29/Dockerfile")) {
+                        return CommandResult.ok("MISSING", 1);
+                    }
+                    return CommandResult.ok("MISSING", 1); // extract 也不存在
+                });
+        DockerStartExecutor ex = new DockerStartExecutor(sshService);
+        assertThat(ex.normalizeBuildContext("/opt/x", compose, 1L)).isEqualTo(compose);
+    }
+
+    @Test
+    @DisplayName("execute: 上传 compose context: . → 写盘前规范化为 ./extract（复现部署 94/95 缺陷）")
+    void dockerExecute_rootContext_normalizedBeforeWrite() {
+        String compose = "services:\n  backend:\n    build:\n      context: .\n      dockerfile: Dockerfile.backend\n";
+        when(sshService.execute(eq(1L), anyString(), anyInt()))
+                .thenAnswer(inv -> {
+                    String cmd = inv.getArgument(1);
+                    if (cmd.contains("/opt/deploy/api-manager/29/Dockerfile")) {
+                        return CommandResult.ok("MISSING", 1);
+                    }
+                    return CommandResult.ok("EXISTS", 0);
+                });
+        when(sshService.execute(eq(1L), anyString()))
+                .thenAnswer(inv -> {
+                    String cmd = inv.getArgument(1);
+                    assertThat(cmd).contains("context: ./extract");
+                    assertThat(cmd).contains("dockerfile: extract/Dockerfile.backend");
+                    return CommandResult.ok("", 0);
+                });
+        when(sshService.executeWithRetry(eq(1L), anyString(), anyInt(), anyInt()))
+                .thenReturn(CommandResult.ok("", 0, 1L));
+        DockerStartExecutor ex = new DockerStartExecutor(sshService);
+        ex.execute(1L, "/opt/deploy/api-manager/29", compose, null, null, null);
+    }
+
     @Test
     @DisplayName("execute: deployment.port 已被上轮回写(8082)但 compose 原端口 8080 被占 → 锚定 compose 端口避让")
     void dockerExecute_composePortBusyWhileDeploymentPortFree_avoidsComposePort() {
