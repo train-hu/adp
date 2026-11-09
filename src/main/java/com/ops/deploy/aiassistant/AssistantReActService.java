@@ -177,12 +177,15 @@ public class AssistantReActService {
         String role = user != null ? user.getRole() : "?";
         return "你是 auto-deploy 部署平台的 AI 助手。当前时间：" + now
                 + "，当前用户：" + username + "（角色 " + role + "）。\n"
-                + "能力：1) 分析仪表盘数据并给出运维建议；2) 查询和管理服务器/数据库/项目/部署任务/服务实例/用户；\n"
+                + "能力：1) 分析仪表盘数据并给出运维建议；2) 查询和管理服务器/数据库/项目/部署任务/服务实例/用户/资源分配；\n"
                 + "3) 基于已成功部署服务的文档搜索回答运维问题（先调 search_docs 检索，回答须注明文档来源）。\n"
+                + "资源分配（重要）：把服务器/数据库『分配』给用户有专门的工具 add_server_grant / add_database_grant\n"
+                + "（粒度：单台服务器或单个数据库 → 单个用户，分配后该用户可见并可完全管理该资源），\n"
+                + "不要把这类请求说成『没有接口』，也不要误用 update_user 的项目关联去代替。用户可见性 = 服务器/数据库分配 ∪ 项目关联 ∪ ADMIN 全量。\n"
                 + "计数口径（重要）：问『服务器/数据库资源总数』(如『有几台服务器』『数据库共多少个』)时，\n"
                 + "调用 get_dashboard，用它返回的 serverTotal / databaseTotal 作为全量总数回答；不要用 list_servers / list_databases 的返回条数，\n"
                 + "因为这两个工具只返回当前用户可见项、可能少于总量（尤其非 ADMIN 用户可见数为 0）。\n"
-                + "规则：所有数据必须来自工具调用结果，禁止编造；执行写操作（create/update/delete/cancel/redeploy/rollback/start/stop/restart 等）\n"
+                + "规则：所有数据必须来自工具调用结果，禁止编造；执行写操作（create/update/delete/cancel/redeploy/rollback/start/stop/restart/add_*/remove_* 等）\n"
                 + "前必须先复述将执行的操作并向用户确认语义（在回复中说明），一次只执行一个写操作；权限不足时直接说明，不要重试。";
     }
 
@@ -222,7 +225,14 @@ public class AssistantReActService {
                 new LlmChatClient.ToolDef("function", new LlmChatClient.ToolDefFunction("get_user", "查看用户详情", Map.of("type","object","properties",Map.of("id",Map.of("type","integer"))))),
                 new LlmChatClient.ToolDef("function", new LlmChatClient.ToolDefFunction("create_user", "创建用户", Map.of("type","object","properties",Map.of("username",Map.of("type","string"),"password",Map.of("type","string"))))),
                 new LlmChatClient.ToolDef("function", new LlmChatClient.ToolDefFunction("update_user", "更新用户", Map.of("type","object","properties",Map.of("id",Map.of("type","integer"))))),
-                new LlmChatClient.ToolDef("function", new LlmChatClient.ToolDefFunction("delete_user", "删除用户", Map.of("type","object","properties",Map.of("id",Map.of("type","integer"))))),
+                new LlmChatClient.ToolDef("function", new LlmChatClient.ToolDefFunction("delete_user", "删除用户（仅管理员）", Map.of("type","object","properties",Map.of("id",Map.of("type","integer"))))),
+                // ---- 资源分配（服务器/数据库按用户分配，仅 ADMIN）----
+                new LlmChatClient.ToolDef("function", new LlmChatClient.ToolDefFunction("list_server_grants", "列出某台服务器已分配给哪些用户（仅管理员）。用户通过'服务器分配'或'项目关联'获得资源可见性，二者正交。", Map.of("type","object","properties",Map.of("serverId",Map.of("type","integer"))))),
+                new LlmChatClient.ToolDef("function", new LlmChatClient.ToolDefFunction("add_server_grant", "把一台服务器分配给某个用户（仅管理员，被分配用户须为 OPS/ADMIN）。分配后该用户可见并可完全管理这台服务器（编辑/删除/测试连通性）。这是'服务器→用户'的精确分配，区别于 update_user 的项目关联。", Map.of("type","object","properties",Map.of("serverId",Map.of("type","integer"),"userId",Map.of("type","integer"))))),
+                new LlmChatClient.ToolDef("function", new LlmChatClient.ToolDefFunction("remove_server_grant", "移除某台服务器对某用户的分配（仅管理员）", Map.of("type","object","properties",Map.of("serverId",Map.of("type","integer"),"userId",Map.of("type","integer"))))),
+                new LlmChatClient.ToolDef("function", new LlmChatClient.ToolDefFunction("list_database_grants", "列出某数据库已分配给哪些用户（仅管理员）", Map.of("type","object","properties",Map.of("databaseId",Map.of("type","integer"))))),
+                new LlmChatClient.ToolDef("function", new LlmChatClient.ToolDefFunction("add_database_grant", "把一个数据库分配给某个用户，该用户获得该数据库的完全管理权（仅管理员，被分配用户须为 OPS/ADMIN）", Map.of("type","object","properties",Map.of("databaseId",Map.of("type","integer"),"userId",Map.of("type","integer"))))),
+                new LlmChatClient.ToolDef("function", new LlmChatClient.ToolDefFunction("remove_database_grant", "移除某数据库对某用户的分配（仅管理员）", Map.of("type","object","properties",Map.of("databaseId",Map.of("type","integer"),"userId",Map.of("type","integer"))))),
                 new LlmChatClient.ToolDef("function", new LlmChatClient.ToolDefFunction("search_docs", "检索部署文档知识库", Map.of("type","object","properties",Map.of("keyword",Map.of("type","string"))))));
     }
 

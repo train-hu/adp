@@ -15,6 +15,7 @@ import com.ops.deploy.project.ProjectCreateRequest;
 import com.ops.deploy.project.ProjectService;
 import com.ops.deploy.project.ProjectUpdateRequest;
 import com.ops.deploy.security.AuthUser;
+import com.ops.deploy.security.ResourceAccessService;
 import com.ops.deploy.server.ServerCreateRequest;
 import com.ops.deploy.server.ServerService;
 import com.ops.deploy.server.ServerUpdateRequest;
@@ -54,6 +55,7 @@ public class AssistantToolExecutor {
     private final ServiceInstanceService instanceService;
     private final UserService userService;
     private final ProjectAccessService accessService;
+    private final ResourceAccessService resourceAccess;
     private final KnowledgeBaseSearcher knowledgeBase;
 
     /** 保留 ObjectMapper 以便未来扩展（当前 dispatch 返回类型均为可直接序列化对象）。 */
@@ -68,6 +70,7 @@ public class AssistantToolExecutor {
                                  ServiceInstanceService instanceService,
                                  UserService userService,
                                  ProjectAccessService accessService,
+                                 ResourceAccessService resourceAccess,
                                  KnowledgeBaseSearcher knowledgeBase) {
         this.dashboardService = dashboardService;
         this.serverService = serverService;
@@ -77,6 +80,7 @@ public class AssistantToolExecutor {
         this.instanceService = instanceService;
         this.userService = userService;
         this.accessService = accessService;
+        this.resourceAccess = resourceAccess;
         this.knowledgeBase = knowledgeBase;
     }
 
@@ -142,6 +146,39 @@ public class AssistantToolExecutor {
             case "create_user" -> { requireAdmin(user); yield userService.create(toUserCreate(args)); }
             case "update_user" -> { requireAdmin(user); yield userService.update(longArg(args, "id"), toUserUpdate(args)); }
             case "delete_user" -> { requireAdmin(user); long id = longArg(args, "id"); userService.delete(id); yield "已删除用户 id=" + id; }
+
+            // ---- 资源分配（服务器/数据库按用户分配，ADMIN only）----
+            // 分配粒度是"单台服务器/单个数据库 → 单个用户"（server_grant/db_grant），
+            // 与项目关联（update_user 的 projectIds）正交：被分配用户获得该资源的 OPS 级管理权。
+            // service 方法带 AuthUser operator（审计），RBAC 由 requireAdmin 在调用前强制。
+            case "list_server_grants" -> {
+                requireAdmin(user);
+                yield resourceAccess.listServerGrants(longArg(args, "serverId"));
+            }
+            case "add_server_grant" -> {
+                requireAdmin(user);
+                yield resourceAccess.addServerGrant(longArg(args, "serverId"), longArg(args, "userId"), user);
+            }
+            case "remove_server_grant" -> {
+                requireAdmin(user);
+                long serverId = longArg(args, "serverId");
+                resourceAccess.removeServerGrant(serverId, longArg(args, "userId"), user);
+                yield "已移除服务器 id=" + serverId + " 对用户 id=" + longArg(args, "userId") + " 的分配";
+            }
+            case "list_database_grants" -> {
+                requireAdmin(user);
+                yield resourceAccess.listDatabaseGrants(longArg(args, "databaseId"));
+            }
+            case "add_database_grant" -> {
+                requireAdmin(user);
+                yield resourceAccess.addDatabaseGrant(longArg(args, "databaseId"), longArg(args, "userId"), user);
+            }
+            case "remove_database_grant" -> {
+                requireAdmin(user);
+                long databaseId = longArg(args, "databaseId");
+                resourceAccess.removeDatabaseGrant(databaseId, longArg(args, "userId"), user);
+                yield "已移除数据库 id=" + databaseId + " 对用户 id=" + longArg(args, "userId") + " 的分配";
+            }
 
             // ---- 知识库（成功部署文档问答）----
             case "search_docs" -> knowledgeBase.search(strArg(args, "keyword"), intArg(args, "limit", 3), user);
